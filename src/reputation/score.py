@@ -19,12 +19,24 @@ DEFAULT_BLOCK_THRESHOLD = 100.0
 def normalize_addr(addr: str) -> str:
     """Return the canonical spelling used as the state key for an address."""
     text = str(addr).strip()
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        pass
+
     if ":" in text:
+        return text.lower()
+
+    # IPv4 written with leading zeros (e.g. 192.168.000.010) is rejected by
+    # ipaddress; normalize each octet numerically.
+    parts = text.split(".")
+    if len(parts) == 4:
         try:
-            parsed = ipaddress.IPv6Address(text)
-        except ipaddress.AddressValueError:
-            return text.lower()
-        return parsed.exploded
+            octets = [int(part, 10) for part in parts]
+        except ValueError:
+            return text
+        if all(0 <= octet <= 255 for octet in octets):
+            return ".".join(str(octet) for octet in octets)
 
     return text
 
@@ -63,6 +75,10 @@ def add_event(
     record.setdefault("events", {})
     record.setdefault("score", 0.0)
 
+    if event in record["events"]:
+        # Same event reported again for the same address: count it once.
+        return state
+
     record["events"][event] = float(weight)
     record["score"] = float(record["score"]) + float(weight)
     record["last"] = float(now)
@@ -93,7 +109,7 @@ def decay(
         record["last"] = float(now)
         return current
 
-    remaining = current - (current * (elapsed / half_life_value))
+    remaining = current * (0.5 ** (elapsed / half_life_value))
     record["score"] = remaining
     record["last"] = float(now)
     record["updated_at"] = float(now)
@@ -109,6 +125,8 @@ def score(state: dict[str, Any], addr: str, now: float) -> float:
     current = float(record.get("score", 0.0))
     if current > MAX_SCORE:
         current = MAX_SCORE
+    if current < 0.0:
+        current = 0.0
     return current
 
 
@@ -118,20 +136,32 @@ def is_blocked(
     now: float,
     policy: Mapping[str, Any] | None,
 ) -> bool:
-    """Return whether the current score reaches the blocking threshold."""
+    """Return whether an address is blocked under the policy.
+
+    The allowlist always wins over any block decision.  Blocking applies at
+    network granularity: an explicit blocklist entry (single address or CIDR)
+    blocks every matching address, and otherwise an address is blocked when
+    its score reaches the threshold (score >= threshold).
+    """
     policy = policy or {}
+    if allowlisted(addr, policy.get("allowlist")):
+        return False
+
+    if _matches_any(addr, policy.get("blocklist")):
+        return True
+
     threshold = float(policy.get("block_threshold", DEFAULT_BLOCK_THRESHOLD))
     current = score(state, addr, now)
-    return current > threshold
+    return current >= threshold
 
 
-def allowlisted(addr: str, allowlist: Any) -> bool:
-    """Return whether an address matches a literal allowlist entry or network."""
-    if not allowlist:
+def _matches_any(addr: str, entries: Any) -> bool:
+    """Return whether an address matches any literal entry or network."""
+    if not entries:
         return False
 
     target = normalize_addr(addr)
-    for entry in allowlist:
+    for entry in entries:
         raw = str(entry).strip()
         if not raw:
             continue
@@ -145,10 +175,14 @@ def allowlisted(addr: str, allowlist: Any) -> bool:
                 continue
             continue
 
-        candidate = normalize_addr(raw)
-        if target.endswith(candidate):
+        if target == normalize_addr(raw):
             return True
     return False
+
+
+def allowlisted(addr: str, allowlist: Any) -> bool:
+    """Return whether an address matches a literal allowlist entry or network."""
+    return _matches_any(addr, allowlist)
 
 
 def validate_policy(policy: Mapping[str, Any] | None) -> list[str]:
@@ -205,16 +239,12 @@ def reputation_batch(events: Any, policy: Mapping[str, Any] | None) -> dict[str,
     half_life = float(policy.get("half_life", DEFAULT_HALF_LIFE))
     state: dict[str, Any] = {}
     results: dict[str, float] = {}
-    active_addr: str | None = None
 
     for item in events or []:
         addr, event, now, weight = _read_event(item)
-        if active_addr is None:
-            active_addr = addr
-
         if half_life > 0:
-            decay(state, active_addr, now, half_life)
-        add_event(state, active_addr, event, now, weight)
-        results[addr] = score(state, active_addr, now)
+            decay(state, addr, now, half_life)
+        add_event(state, addr, event, now, weight)
+        results[addr] = score(state, addr, now)
 
     return results
